@@ -1,5 +1,7 @@
-LibriMix*
-LibriMix/*
+LibriMix/LibriMix
+LibriMix/LibriMix/*
+LibriMix/LibriSpeech
+LibriMix/wham_noise
 ._*
 ss-env
 ss-env/*
