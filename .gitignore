@@ -1,0 +1,12 @@
+LibriMix*
+LibriMix/*
+._*
+ss-env
+ss-env/*
+__*
+*.zip
+CMGAN/AudioSamples/
+.DS*
+**/__pycache__
+**/__
+CMGAN/src/pretrained_models/
