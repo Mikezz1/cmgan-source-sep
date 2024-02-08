@@ -45,7 +45,7 @@ parser.add_argument(
 parser.add_argument(
     "--loss_weights",
     type=list,
-    default=[0.1, 0.9, 0.2, 0.05],
+    default=[0.1, 0.2, 0.2, 0.5],
     help="weights of RI components, magnitude, time loss, and Metric Disc",
 )
 args = parser.parse_args()
@@ -71,7 +71,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class Trainer:
     def __init__(self, train_ds, test_ds):
-        self.n_fft = 100
+        self.n_fft = 160
         self.hop = 100
         self.train_ds = train_ds
         self.test_ds = test_ds
@@ -94,6 +94,7 @@ class Trainer:
         self.speaker_embedder = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb"
         )
+        self.speaker_embedder = self.speaker_embedder.to(device)
         self.si_snr = ScaleInvariantSignalNoiseRatio()
 
     def forward_generator_step(self, clean, noisy, reference):
@@ -104,7 +105,7 @@ class Trainer:
             clean * c, 0, 1
         )
 
-        se = self.speaker_embedder.encode_batch(reference)
+        se = self.speaker_embedder.encode_batch(reference.to(device))
 
         noisy_spec = torch.stft(
             noisy,
@@ -112,6 +113,7 @@ class Trainer:
             self.hop,
             window=torch.hamming_window(self.n_fft).to(device),
             onesided=True,
+            return_complex=False,
         )
         clean_spec = torch.stft(
             clean,
@@ -119,6 +121,7 @@ class Trainer:
             self.hop,
             window=torch.hamming_window(self.n_fft).to(device),
             onesided=True,
+            return_complex=False,
         )
         noisy_spec = power_compress(noisy_spec).permute(0, 1, 3, 2)
         clean_spec = power_compress(clean_spec)
@@ -132,7 +135,7 @@ class Trainer:
 
         est_spec_uncompress = power_uncompress(est_real, est_imag).squeeze(1)
         est_audio = torch.istft(
-            est_spec_uncompress,
+            torch.view_as_complex(est_spec_uncompress),
             self.n_fft,
             self.hop,
             window=torch.hamming_window(self.n_fft).to(device),
@@ -150,12 +153,16 @@ class Trainer:
         }
 
     def calculate_generator_loss(self, generator_outputs):
-        predict_fake_metric = self.discriminator(
-            generator_outputs["clean_mag"], generator_outputs["est_mag"]
-        )
-        gen_loss_GAN = F.mse_loss(
-            predict_fake_metric.flatten(), generator_outputs["one_labels"].float()
-        )
+        length = generator_outputs["est_audio"].size(-1)
+        est_audio_list = generator_outputs["est_audio"]
+        clean_audio_list = generator_outputs["clean"][:, :length]
+        gen_loss_GAN = -discriminator.batch_pesq(est_audio_list, clean_audio_list)
+        # predict_fake_metric = self.discriminator(
+        #     generator_outputs["clean_mag"], generator_outputs["est_mag"]
+        # )
+        # gen_loss_GAN = F.mse_loss(
+        #     predict_fake_metric.flatten(), generator_outputs["one_labels"].float()
+        # )
 
         loss_mag = F.mse_loss(
             generator_outputs["est_mag"], generator_outputs["clean_mag"]
@@ -179,11 +186,14 @@ class Trainer:
 
     def calculate_discriminator_loss(self, generator_outputs):
         length = generator_outputs["est_audio"].size(-1)
-        est_audio_list = list(generator_outputs["est_audio"].detach().cpu().numpy())
-        clean_audio_list = list(generator_outputs["clean"].cpu().numpy()[:, :length])
-        pesq_score = discriminator.batch_pesq(clean_audio_list, est_audio_list)
+        est_audio_list = generator_outputs["est_audio"].detach()
+        clean_audio_list = generator_outputs["clean"][:, :length]
+        pesq_score = discriminator.batch_pesq(est_audio_list, clean_audio_list)
+
+        # print(discriminator.batch_pesq(clean_audio_list, clean_audio_list))
 
         # The calculation of PESQ can be None due to silent part
+
         if pesq_score is not None:
             predict_enhance_metric = self.discriminator(
                 generator_outputs["clean_mag"], generator_outputs["est_mag"].detach()
@@ -192,10 +202,17 @@ class Trainer:
                 generator_outputs["clean_mag"], generator_outputs["clean_mag"]
             )
             discrim_loss_metric = F.mse_loss(
-                predict_max_metric.flatten(), generator_outputs["one_labels"]
+                predict_max_metric.flatten(),
+                discriminator.batch_pesq(
+                    clean_audio_list, clean_audio_list
+                ).detach(),  # generator_outputs["one_labels"]
             ) + F.mse_loss(predict_enhance_metric.flatten(), pesq_score)
         else:
             discrim_loss_metric = None
+
+        print(
+            predict_max_metric.mean(), predict_enhance_metric.mean(), pesq_score.mean()
+        )
 
         return discrim_loss_metric
 
@@ -224,7 +241,9 @@ class Trainer:
         loss.backward()
         self.optimizer.step()
         # Train Discriminator
-        discrim_loss_metric = self.calculate_discriminator_loss(generator_outputs)
+        discrim_loss_metric = (
+            None  # self.calculate_discriminator_loss(generator_outputs)
+        )
 
         if discrim_loss_metric is not None:
             self.optimizer_disc.zero_grad()
@@ -252,7 +271,9 @@ class Trainer:
 
         loss = self.calculate_generator_loss(generator_outputs)
 
-        discrim_loss_metric = self.calculate_discriminator_loss(generator_outputs)
+        discrim_loss_metric = (
+            None  # self.calculate_discriminator_loss(generator_outputs)
+        )
         if discrim_loss_metric is None:
             discrim_loss_metric = torch.tensor([0.0])
 
@@ -309,8 +330,8 @@ class Trainer:
             )
             if not os.path.exists(args.save_model_dir):
                 os.makedirs(args.save_model_dir)
-            if self.gpu_id == 0:
-                torch.save(self.model.module.state_dict(), path)
+            # if self.gpu_id == 0:
+            torch.save(self.model.state_dict(), path)
             scheduler_G.step()
             scheduler_D.step()
 

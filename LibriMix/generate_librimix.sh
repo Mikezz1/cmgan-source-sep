@@ -78,6 +78,6 @@ for n_src in 2; do
     --librimix_outdir $librimix_outdir \
     --n_src $n_src \
     --freqs 8k \
-    --modes max \
+    --modes min \
     --types mix_clean
 done

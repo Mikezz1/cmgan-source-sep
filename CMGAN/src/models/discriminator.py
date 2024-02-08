@@ -6,24 +6,39 @@ import torch.nn as nn
 from utils import LearnableSigmoid
 
 
-def pesq_loss(clean, noisy, sr=16000):
-    try:
-        pesq_score = pesq(sr, clean, noisy, "wb")
-    except:
-        # error can happen due to silent period
-        pesq_score = -1
-    return pesq_score
+# def pesq_loss(clean, noisy, sr=16000):
+#     try:
+#         pesq_score = pesq(sr, clean, noisy, "wb")
+#     except:
+#         # error can happen due to silent period
+#         pesq_score = -1
+#     return pesq_score
 
 
-def batch_pesq(clean, noisy):
-    pesq_score = Parallel(n_jobs=-1)(
-        delayed(pesq_loss)(c, n) for c, n in zip(clean, noisy)
+# def batch_pesq(clean, noisy):
+#     return 20 * torch.log10(
+#         torch.linalg.norm(clean) / (torch.linalg.norm(clean - noisy) + 1e-6) + 1e-6
+#     )
+
+
+def batch_pesq(est, target):
+    alpha = (target * est).sum() / torch.linalg.norm(target) ** 2
+    return 20 * torch.log10(
+        torch.linalg.norm(alpha * target)
+        / (torch.linalg.norm(alpha * target - est) + 1e-6)
+        + 1e-6
     )
-    pesq_score = np.array(pesq_score)
-    if -1 in pesq_score:
-        return None
-    pesq_score = (pesq_score - 1) / 3.5
-    return torch.FloatTensor(pesq_score)  # .to("cuda")
+
+
+# def batch_pesq(clean, noisy):
+#     pesq_score = Parallel(n_jobs=-1)(
+#         delayed(pesq_loss)(c, n) for c, n in zip(clean, noisy)
+#     )
+#     pesq_score = np.array(pesq_score)
+#     if -1 in pesq_score:
+#         return None
+#     pesq_score = (pesq_score - 1) / 3.5
+#     return torch.FloatTensor(pesq_score).to("cuda")
 
 
 class Discriminator(nn.Module):

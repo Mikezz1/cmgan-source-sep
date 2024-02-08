@@ -2,6 +2,8 @@ LibriMix/LibriMix
 LibriMix/LibriMix/*
 LibriMix/LibriSpeech
 LibriMix/wham_noise
+LibriMix/LibriSpeech/*
+LibriMix/wham_noise/*
 ._*
 ss-env
 ss-env/*
@@ -12,3 +14,4 @@ CMGAN/AudioSamples/
 **/__pycache__
 **/__
 CMGAN/src/pretrained_models/
+*.ipynb
