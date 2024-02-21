@@ -13,7 +13,8 @@ from torch.utils.data.distributed import DistributedSampler
 
 
 class LibrimixDataset(torch.utils.data.Dataset):
-    def __init__(self, data_dir, cut_len=16000 * 2):
+    def __init__(self, data_dir, cut_len=16000 * 2, overfit=False):
+        self.overfit = overfit
         self.cut_len = cut_len
         self.mix_dir = os.path.join(data_dir, "mix")
         self.target_dir = os.path.join(data_dir, "target")
@@ -38,7 +39,20 @@ class LibrimixDataset(torch.utils.data.Dataset):
 
         target_speaker = self.target_wav_name[idx].split("-")[0]
         reference_files = self.speaker_mapping[target_speaker]
-        reference_file = reference_files[random.randint(0, len(reference_files) - 1)]
+
+        if self.overfit:
+            reference_file = reference_files[0]
+            for file in reference_files:
+                if file != target_file and len(reference_files) > 1:
+                    reference_file = file
+
+            reference_file = reference_files[
+                random.randint(0, len(reference_files) - 1)
+            ]
+        else:
+            reference_file = reference_files[
+                random.randint(0, len(reference_files) - 1)
+            ]
         reference_file = os.path.join(self.target_dir, reference_file)
 
         mix_file = os.path.join(self.mix_dir, self.target_wav_name[idx])
@@ -70,11 +84,17 @@ class LibrimixDataset(torch.utils.data.Dataset):
             reference_ds = torch.cat(reference_ds_final, dim=-1)
         else:
             # randomly cut 2 seconds segment
-            wav_start = random.randint(0, length - self.cut_len)
+            if self.overfit:
+                wav_start = 0
+            else:
+                wav_start = random.randint(0, length - self.cut_len)
             mix_ds = mix_ds[wav_start : wav_start + self.cut_len]
             target_ds = target_ds[wav_start : wav_start + self.cut_len]
 
-            wav_start = random.randint(0, reference_ds.size(0) - self.cut_len * 2)
+            if self.overfit:
+                wav_start = 0
+            else:
+                wav_start = random.randint(0, length - self.cut_len)
             reference_ds = reference_ds[wav_start : wav_start + self.cut_len * 2]
 
         return target_ds, mix_ds, length, reference_ds
@@ -121,13 +141,13 @@ class DemandDataset(torch.utils.data.Dataset):
         return clean_ds, noisy_ds, length
 
 
-def load_data(ds_dir, batch_size, n_cpu, cut_len):
+def load_data(ds_dir, batch_size, n_cpu, cut_len, overfit=False):
     # torchaudio.set_audio_backend("sox_io")  # in linux
     train_dir = os.path.join(ds_dir, "train")
     test_dir = os.path.join(ds_dir, "test")
 
-    train_ds = LibrimixDataset(train_dir, cut_len)
-    test_ds = LibrimixDataset(test_dir, cut_len)
+    train_ds = LibrimixDataset(train_dir, cut_len, overfit=overfit)
+    test_ds = LibrimixDataset(test_dir, cut_len, overfit=overfit)
 
     train_dataset = torch.utils.data.DataLoader(
         dataset=train_ds,

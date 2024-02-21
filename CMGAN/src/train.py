@@ -19,18 +19,18 @@ from speechbrain.pretrained import EncoderClassifier
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--epochs", type=int, default=120, help="number of epochs of training"
+    "--epochs", type=int, default=700, help="number of epochs of training"
 )
-parser.add_argument("--batch_size", type=int, default=8)
-parser.add_argument("--log_interval", type=int, default=50)
+parser.add_argument("--batch_size", type=int, default=4)
+parser.add_argument("--log_interval", type=int, default=1)
 parser.add_argument(
-    "--decay_epoch", type=int, default=30, help="epoch from which to start lr decay"
+    "--decay_epoch", type=int, default=50, help="epoch from which to start lr decay"
 )
 parser.add_argument("--init_lr", type=float, default=5e-4, help="initial learning rate")
 parser.add_argument(
     "--cut_len",
     type=int,
-    default=4000,
+    default=16000,
     help="cut length, default is 2 seconds in denoise " "and dereverberation",
 )
 parser.add_argument(
@@ -70,32 +70,23 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 class Trainer:
-    def __init__(self, train_ds, test_ds):
+    def __init__(self, train_ds, test_ds, overfit=False):
         self.n_fft = 160
         self.hop = 100
+        self.overfit = overfit
         self.train_ds = train_ds
         self.test_ds = test_ds
         self.model = TSCNet(num_channel=64, num_features=self.n_fft // 2 + 1).to(device)
         summary(
             self.model, [(1, 2, args.cut_len // self.hop + 1, int(self.n_fft / 2) + 1)]
         )
-        self.discriminator = discriminator.Discriminator(ndf=16).to(device)
-        summary(
-            self.discriminator,
-            [
-                (1, 1, int(self.n_fft / 2) + 1, args.cut_len // self.hop + 1),
-                (1, 1, int(self.n_fft / 2) + 1, args.cut_len // self.hop + 1),
-            ],
-        )
+
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.init_lr)
-        self.optimizer_disc = torch.optim.AdamW(
-            self.discriminator.parameters(), lr=2 * args.init_lr
-        )
+
         self.speaker_embedder = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb"
         )
         self.speaker_embedder = self.speaker_embedder.to(device)
-        self.si_snr = ScaleInvariantSignalNoiseRatio()
 
     def forward_generator_step(self, clean, noisy, reference):
         # Normalization
@@ -156,13 +147,7 @@ class Trainer:
         length = generator_outputs["est_audio"].size(-1)
         est_audio_list = generator_outputs["est_audio"]
         clean_audio_list = generator_outputs["clean"][:, :length]
-        gen_loss_GAN = -discriminator.batch_pesq(est_audio_list, clean_audio_list)
-        # predict_fake_metric = self.discriminator(
-        #     generator_outputs["clean_mag"], generator_outputs["est_mag"]
-        # )
-        # gen_loss_GAN = F.mse_loss(
-        #     predict_fake_metric.flatten(), generator_outputs["one_labels"].float()
-        # )
+        gen_loss_GAN = -discriminator.sdr_loss(est_audio_list, clean_audio_list)
 
         loss_mag = F.mse_loss(
             generator_outputs["est_mag"], generator_outputs["clean_mag"]
@@ -183,38 +168,6 @@ class Trainer:
         )
 
         return loss
-
-    def calculate_discriminator_loss(self, generator_outputs):
-        length = generator_outputs["est_audio"].size(-1)
-        est_audio_list = generator_outputs["est_audio"].detach()
-        clean_audio_list = generator_outputs["clean"][:, :length]
-        pesq_score = discriminator.batch_pesq(est_audio_list, clean_audio_list)
-
-        # print(discriminator.batch_pesq(clean_audio_list, clean_audio_list))
-
-        # The calculation of PESQ can be None due to silent part
-
-        if pesq_score is not None:
-            predict_enhance_metric = self.discriminator(
-                generator_outputs["clean_mag"], generator_outputs["est_mag"].detach()
-            )
-            predict_max_metric = self.discriminator(
-                generator_outputs["clean_mag"], generator_outputs["clean_mag"]
-            )
-            discrim_loss_metric = F.mse_loss(
-                predict_max_metric.flatten(),
-                discriminator.batch_pesq(
-                    clean_audio_list, clean_audio_list
-                ).detach(),  # generator_outputs["one_labels"]
-            ) + F.mse_loss(predict_enhance_metric.flatten(), pesq_score)
-        else:
-            discrim_loss_metric = None
-
-        print(
-            predict_max_metric.mean(), predict_enhance_metric.mean(), pesq_score.mean()
-        )
-
-        return discrim_loss_metric
 
     def train_step(self, batch):
         # Trainer generator
@@ -241,18 +194,9 @@ class Trainer:
         loss.backward()
         self.optimizer.step()
         # Train Discriminator
-        discrim_loss_metric = (
-            None  # self.calculate_discriminator_loss(generator_outputs)
-        )
+        discrim_loss_metric = None
 
-        if discrim_loss_metric is not None:
-            self.optimizer_disc.zero_grad()
-            discrim_loss_metric.backward()
-            self.optimizer_disc.step()
-        else:
-            discrim_loss_metric = torch.tensor([0.0])
-
-        return loss.item(), discrim_loss_metric.item(), snr
+        return loss.item(), 0, snr
 
     @torch.no_grad()
     def test_step(self, batch):
@@ -274,14 +218,11 @@ class Trainer:
         discrim_loss_metric = (
             None  # self.calculate_discriminator_loss(generator_outputs)
         )
-        if discrim_loss_metric is None:
-            discrim_loss_metric = torch.tensor([0.0])
 
-        return loss.item(), discrim_loss_metric.item()
+        return loss.item(), 0  # discrim_loss_metric.item()
 
     def test(self):
         self.model.eval()
-        self.discriminator.eval()
         gen_loss_total = 0.0
         disc_loss_total = 0.0
         for idx, batch in enumerate(self.test_ds):
@@ -302,12 +243,11 @@ class Trainer:
         scheduler_G = torch.optim.lr_scheduler.StepLR(
             self.optimizer, step_size=args.decay_epoch, gamma=0.5
         )
-        scheduler_D = torch.optim.lr_scheduler.StepLR(
-            self.optimizer_disc, step_size=args.decay_epoch, gamma=0.5
-        )
+        # scheduler_D = torch.optim.lr_scheduler.StepLR(
+        #     self.optimizer_disc, step_size=args.decay_epoch, gamma=0.5
+        # )
         for epoch in range(args.epochs):
             self.model.train()
-            self.discriminator.train()
             for idx, batch in enumerate(self.train_ds):
                 step = idx + 1
                 loss, disc_loss, snr = self.train_step(batch)
@@ -323,17 +263,20 @@ class Trainer:
                             "train/snr": snr,
                         }
                     )
-            gen_loss = self.test()
-            path = os.path.join(
-                args.save_model_dir,
-                "CMGAN_epoch_" + str(epoch) + "_" + str(gen_loss)[:5],
-            )
+
+            if not self.overfit:
+                gen_loss = self.test()
+                path = os.path.join(
+                    args.save_model_dir,
+                    "CMGAN_epoch_" + str(epoch) + "_" + str(gen_loss)[:5],
+                )
             if not os.path.exists(args.save_model_dir):
                 os.makedirs(args.save_model_dir)
             # if self.gpu_id == 0:
-            torch.save(self.model.state_dict(), path)
+            if not self.overfit:
+                torch.save(self.model.state_dict(), path)
             scheduler_G.step()
-            scheduler_D.step()
+            # scheduler_D.step()
 
 
 def main(args):
@@ -349,7 +292,7 @@ def main(args):
         },
     )
     train_ds, test_ds = dataloader.load_data(
-        args.data_dir, args.batch_size, 4, args.cut_len
+        args.data_dir, args.batch_size, 4, args.cut_len, overfit=False
     )
     trainer = Trainer(train_ds, test_ds)
     trainer.train()

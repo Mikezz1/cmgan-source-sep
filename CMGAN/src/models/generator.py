@@ -102,7 +102,7 @@ class TSCB(nn.Module):
         if speaker_embed is not None:
             se = self.se_projection(speaker_embed).transpose(1, 2).unsqueeze(-1)
             x_f = x_f + se
-            x_f = self.ln(x_f.transpose(1, 3)).transpose(1, 3)
+            # x_f = self.ln(x_f.transpose(1, 3)).transpose(1, 3)
         return x_f
 
 
