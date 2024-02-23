@@ -182,12 +182,12 @@ class Trainer:
         clean_audio_list = generator_outputs["clean"][:, :length]
         gen_loss_GAN = -discriminator.sdr_loss(est_audio_list, clean_audio_list)
 
-        loss_mag = F.mse_loss(
+        loss_mag = F.l1_loss(
             generator_outputs["est_mag"], generator_outputs["clean_mag"]
         )
-        loss_ri = F.mse_loss(
+        loss_ri = F.l1_loss(
             generator_outputs["est_real"], generator_outputs["clean_real"]
-        ) + F.mse_loss(generator_outputs["est_imag"], generator_outputs["clean_imag"])
+        ) + F.l1_loss(generator_outputs["est_imag"], generator_outputs["clean_imag"])
 
         time_loss = torch.mean(
             torch.abs(generator_outputs["est_audio"] - generator_outputs["clean"])
@@ -305,7 +305,8 @@ class Trainer:
             max_lr=1e-3,
             epochs=args.epochs,
             steps_per_epoch=num_batches,
-            pct_start=10,
+            pct_start=0.1,
+            final_div_factor=100.0,
         )
         # scheduler_D = torch.optim.lr_scheduler.StepLR(
         #     self.optimizer_disc, step_size=args.decay_epoch, gamma=0.5
@@ -354,6 +355,7 @@ class Trainer:
                             "model/grad_norm": self.get_grad_norm(self.model),
                         }
                     )
+                scheduler_G.step()
 
             if not self.overfit:
                 gen_loss = self.test()
@@ -366,7 +368,7 @@ class Trainer:
             # if self.gpu_id == 0:
             if not self.overfit:
                 torch.save(self.model.state_dict(), path)
-            scheduler_G.step()
+
             # scheduler_D.step()
 
 
