@@ -25,4 +25,4 @@ mv  libri100min/test/s1 libri100min/test/target
 # download overfit ds
 
 wget https://www.dropbox.com/scl/fi/a2juz4usbliwufnimrz9k/overfit_ds.zip?rlkey=3atk8ntb1h2bqhdsuwvg2le7l&dl=0
-unzip overfit_ds.zip?rlkey=3atk8ntb1h2bqhdsuwvg2le7l&dl=0
+unzip overfit_ds.zip?rlkey=3atk8ntb1h2bqhdsuwvg2le7l

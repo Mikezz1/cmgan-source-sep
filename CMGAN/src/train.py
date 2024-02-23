@@ -203,7 +203,13 @@ class Trainer:
         loss.backward()
         self.optimizer.step()
 
-        return loss.item(), sdr
+        return (
+            loss.item(),
+            sdr,
+            generator_outputs["est_audio"].cpu().detach(),
+            clean.cpu(),
+            noisy.cpu(),
+        )
 
     @torch.no_grad()
     def test_step(self, batch):
@@ -233,7 +239,7 @@ class Trainer:
         gen_loss_avg = gen_loss_total / step
 
         template = "GPU: {}, Generator loss: {}, Discriminator loss: {}"
-        wandb.log({"test/loss": gen_loss_avg.detach().cpu()})
+        wandb.log({"test/loss": gen_loss_avg})
         logging.info(template.format(0, gen_loss_avg))
 
         return gen_loss_avg
@@ -249,7 +255,7 @@ class Trainer:
             self.model.train()
             for idx, batch in enumerate(self.train_ds):
                 step = idx + 1
-                loss, snr = self.train_step(batch)
+                loss, snr, generated_audio, clean, noisy = self.train_step(batch)
                 template = "GPU: {}, Epoch {}, Step {}, loss: {}, snr: {}"
                 if (step % args.log_interval) == 0:
                     logging.info(template.format(0, epoch, step, loss, snr))
@@ -257,6 +263,16 @@ class Trainer:
                         {
                             "train/loss": loss,
                             "train/snr": snr,
+                            "train/lr": scheduler_G.get_last_lr(),
+                            "train/audio_source": wandb.Audio(
+                                clean[0].numpy().T, sample_rate=8000
+                            ),
+                            "train/audio_est": wandb.Audio(
+                                generated_audio[0].numpy().T, sample_rate=8000
+                            ),
+                            "train/audio_mix": wandb.Audio(
+                                noisy[0].numpy().T, sample_rate=8000
+                            ),
                         }
                     )
 
