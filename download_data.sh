@@ -9,11 +9,9 @@ unzip test.zip?rlkey=172pmq41qyhzpmvav2gy89k27
 
 mkdir libri100min
 
-cp -r test libri100min
-rm -rf test
+mv test libri100min/test
 
-cp -r train-100 libri100min
-rm -rf  train-100
+mv train-100 libri100min/train-100
 
 mv libri100min/train-100  libri100min/train
 

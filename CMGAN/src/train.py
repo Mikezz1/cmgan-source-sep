@@ -9,6 +9,8 @@ import logging
 from torchinfo import summary
 import argparse
 import wandb
+from torch.cuda.amp import GradScaler
+import contextlib
 
 import numpy as np
 
@@ -77,12 +79,14 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 class Trainer:
-    def __init__(self, train_ds, test_ds, overfit=False):
+    def __init__(self, train_ds, test_ds, overfit=False, use_mp=True):
         self.n_fft = 160
         self.hop = 100
         self.overfit = overfit
         self.train_ds = train_ds
         self.test_ds = test_ds
+        self.use_mp = use_mp and torch.cuda.is_available()
+        self.scaler = GradScaler()
         self.model = TSCNet(num_channel=64, num_features=self.n_fft // 2 + 1).to(device)
         summary(
             self.model, [(1, 2, args.cut_len // self.hop + 1, int(self.n_fft / 2) + 1)]
@@ -92,7 +96,10 @@ class Trainer:
 
         self.speaker_embedder = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
-            run_opts={"device": "cuda:0" if torch.cuda.is_available() else "cpu"},
+            run_opts={
+                "device": "cuda:0" if torch.cuda.is_available() else "cpu",
+                "auto_mix_prec": True,
+            },
         )
         self.speaker_embedder = self.speaker_embedder.to(device)
 
@@ -183,25 +190,36 @@ class Trainer:
         noisy = batch[1].to(device)
         reference = batch[-1].to(device)
 
-        one_labels = torch.ones(args.batch_size).to(device)
-
-        generator_outputs = self.forward_generator_step(
-            clean,
-            noisy,
-            reference,
-        )
-        generator_outputs["one_labels"] = one_labels
-        generator_outputs["clean"] = clean
-
-        sdr = si_sdr(
-            generator_outputs["est_audio"].cpu().detach(),
-            generator_outputs["clean"].cpu().detach(),
-        )
-
-        loss = self.calculate_generator_loss(generator_outputs)
         self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+
+        mp_context = (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if self.use_mp
+            else contextlib.suppress()
+        )
+
+        with mp_context:
+            generator_outputs = self.forward_generator_step(
+                clean,
+                noisy,
+                reference,
+            )
+            generator_outputs["clean"] = clean
+
+            sdr = si_sdr(
+                generator_outputs["est_audio"].cpu().detach(),
+                generator_outputs["clean"].cpu().detach(),
+            )
+
+            loss = self.calculate_generator_loss(generator_outputs)
+
+        if self.use_mp:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
 
         return (
             loss.item(),
@@ -231,7 +249,6 @@ class Trainer:
     def test(self):
         self.model.eval()
         gen_loss_total = 0.0
-        disc_loss_total = 0.0
         for idx, batch in enumerate(self.test_ds):
             step = idx + 1
             loss = self.test_step(batch)
@@ -251,31 +268,36 @@ class Trainer:
         # scheduler_D = torch.optim.lr_scheduler.StepLR(
         #     self.optimizer_disc, step_size=args.decay_epoch, gamma=0.5
         # )
+        global_step = 0
         for epoch in range(args.epochs):
             self.model.train()
             for idx, batch in enumerate(self.train_ds):
+                global_step += 1
                 step = idx + 1
                 loss, snr, generated_audio, clean, noisy = self.train_step(batch)
                 template = "GPU: {}, Epoch {}, Step {}, loss: {}, snr: {}"
-                if (step % args.log_interval) == 0:
-                    if not self.overfit or epoch % args.log_interval == 0:
-                        logging.info(template.format(0, epoch, step, loss, snr))
-                        wandb.log(
-                            {
-                                "train/loss": loss,
-                                "train/snr": snr,
-                                "train/lr": scheduler_G.get_last_lr(),
-                                "train/audio_source": wandb.Audio(
-                                    clean[0].numpy().T, sample_rate=8000
-                                ),
-                                "train/audio_est": wandb.Audio(
-                                    generated_audio[0].numpy().T, sample_rate=8000
-                                ),
-                                "train/audio_mix": wandb.Audio(
-                                    noisy[0].numpy().T, sample_rate=8000
-                                ),
-                            }
-                        )
+                if (step % args.log_interval) == 0 or (
+                    self.overfit and (epoch % args.log_interval == 0)
+                ):
+                    logging.info(template.format(0, epoch, step, loss, snr))
+                    wandb.log(
+                        {
+                            "train/loss": loss,
+                            "train/snr": snr,
+                            "train/lr": scheduler_G.get_last_lr(),
+                            "train/audio_source": wandb.Audio(
+                                clean[0].numpy().T, sample_rate=8000
+                            ),
+                            "train/audio_est": wandb.Audio(
+                                generated_audio[0].numpy().T, sample_rate=8000
+                            ),
+                            "train/audio_mix": wandb.Audio(
+                                noisy[0].numpy().T, sample_rate=8000
+                            ),
+                            "train/epoch": epoch,
+                            "train/global_step": global_step,
+                        }
+                    )
 
             if not self.overfit:
                 gen_loss = self.test()
@@ -293,7 +315,11 @@ class Trainer:
 
 
 def main(args):
+
+    torch.backends.cudnn.benchmark = True
+
     wandb.login()
+
     run = wandb.init(
         project="cmgan-ss",
         config={
