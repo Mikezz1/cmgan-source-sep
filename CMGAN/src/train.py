@@ -11,6 +11,7 @@ import argparse
 import wandb
 from torch.cuda.amp import GradScaler
 import contextlib
+from tqdm import tqdm
 
 import numpy as np
 
@@ -21,7 +22,7 @@ from speechbrain.pretrained import EncoderClassifier
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--epochs", type=int, default=700, help="number of epochs of training"
+    "--epochs", type=int, default=20, help="number of epochs of training"
 )
 parser.add_argument("--batch_size", type=int, default=4)
 parser.add_argument("--log_interval", type=int, default=1)
@@ -103,6 +104,23 @@ class Trainer:
         )
         self.speaker_embedder = self.speaker_embedder.to(device)
 
+    @torch.no_grad()
+    def get_grad_norm(self, model, norm_type=2):
+        """
+        Move to utils
+        """
+        parameters = model.parameters()
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        parameters = [p for p in parameters if p.grad is not None]
+        total_norm = torch.norm(
+            torch.stack(
+                [torch.norm(p.grad.detach(), norm_type).cpu() for p in parameters]
+            ),
+            norm_type,
+        )
+        return total_norm.item()
+
     def forward_generator_step(self, clean, noisy, reference):
         # Normalization
         c = torch.sqrt(noisy.size(-1) / torch.sum((noisy**2.0), dim=-1))
@@ -182,7 +200,13 @@ class Trainer:
             + args.loss_weights[3] * gen_loss_GAN
         )
 
-        return loss
+        return (
+            loss,
+            loss_ri.detach().cpu(),
+            loss_mag.detach().cpu(),
+            time_loss.detach().cpu(),
+            gen_loss_GAN.detach().cpu(),
+        )
 
     def train_step(self, batch):
         # Trainer generator
@@ -211,7 +235,9 @@ class Trainer:
                 generator_outputs["clean"].cpu().detach(),
             )
 
-            loss = self.calculate_generator_loss(generator_outputs)
+            loss, loss_ri, loss_mag, time_loss, sdr_loss = (
+                self.calculate_generator_loss(generator_outputs)
+            )
 
         if self.use_mp:
             self.scaler.scale(loss).backward()
@@ -227,6 +253,10 @@ class Trainer:
             generator_outputs["est_audio"].cpu().detach(),
             clean.cpu(),
             noisy.cpu(),
+            loss_ri,
+            loss_mag,
+            time_loss,
+            sdr_loss,
         )
 
     @torch.no_grad()
@@ -242,28 +272,40 @@ class Trainer:
         )
         generator_outputs["clean"] = clean
 
-        loss = self.calculate_generator_loss(generator_outputs)
+        loss, _, _, _, sdr = self.calculate_generator_loss(generator_outputs)
 
-        return loss.item()
+        return loss.item(), sdr.cpu().item()
 
     def test(self):
         self.model.eval()
         gen_loss_total = 0.0
+        sdr_total = 0.0
         for idx, batch in enumerate(self.test_ds):
             step = idx + 1
-            loss = self.test_step(batch)
+            loss, sdr = self.test_step(batch)
             gen_loss_total += loss
+            sdr_total += sdr
         gen_loss_avg = gen_loss_total / step
+        sdr_total_avg = sdr_total / step
 
-        template = "GPU: {}, Generator loss: {}"
-        wandb.log({"test/loss": gen_loss_avg})
-        logging.info(template.format(0, gen_loss_avg))
+        template = "GPU: {}, Validation loss: {}, SDR: {}"
+        wandb.log({"test/loss": gen_loss_avg, "test/snr": sdr_total_avg})
+        logging.info(template.format(0, gen_loss_avg, sdr_total_avg))
 
         return gen_loss_avg
 
     def train(self):
-        scheduler_G = torch.optim.lr_scheduler.StepLR(
-            self.optimizer, step_size=args.decay_epoch, gamma=0.5
+        # scheduler_G = torch.optim.lr_scheduler.StepLR(
+        #     self.optimizer, step_size=args.decay_epoch, gamma=0.5
+        # )
+
+        num_batches = len(self.train_ds)
+        scheduler_G = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=1e-3,
+            epochs=args.epochs,
+            steps_per_epoch=num_batches,
+            pct_start=10,
         )
         # scheduler_D = torch.optim.lr_scheduler.StepLR(
         #     self.optimizer_disc, step_size=args.decay_epoch, gamma=0.5
@@ -274,7 +316,17 @@ class Trainer:
             for idx, batch in enumerate(self.train_ds):
                 global_step += 1
                 step = idx + 1
-                loss, snr, generated_audio, clean, noisy = self.train_step(batch)
+                (
+                    loss,
+                    snr,
+                    generated_audio,
+                    clean,
+                    noisy,
+                    loss_ri,
+                    loss_mag,
+                    time_loss,
+                    sdr_loss,
+                ) = self.train_step(batch)
                 template = "GPU: {}, Epoch {}, Step {}, loss: {}, snr: {}"
                 if (step % args.log_interval) == 0 or (
                     self.overfit and (epoch % args.log_interval == 0)
@@ -284,7 +336,7 @@ class Trainer:
                         {
                             "train/loss": loss,
                             "train/snr": snr,
-                            "train/lr": scheduler_G.get_last_lr(),
+                            "train/lr": scheduler_G.get_last_lr()[0],
                             "train/audio_source": wandb.Audio(
                                 clean[0].numpy().T, sample_rate=8000
                             ),
@@ -296,6 +348,10 @@ class Trainer:
                             ),
                             "train/epoch": epoch,
                             "train/global_step": global_step,
+                            "train/loss_ri": loss_ri,
+                            "train/loss_mag": loss_mag,
+                            "train/time_loss": time_loss,
+                            "model/grad_norm": self.get_grad_norm(self.model),
                         }
                     )
 
