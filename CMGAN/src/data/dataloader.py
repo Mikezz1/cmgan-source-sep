@@ -94,8 +94,8 @@ class LibrimixDataset(torch.utils.data.Dataset):
             if self.overfit:
                 wav_start = 0
             else:
-                wav_start = random.randint(0, reference_ds.size(0) - self.cut_len)
-            reference_ds = reference_ds[wav_start : wav_start + self.cut_len]
+                wav_start = random.randint(0, reference_ds.size(0) - self.cut_len * 2)
+            reference_ds = reference_ds[wav_start : wav_start + self.cut_len * 2]
 
         return target_ds, mix_ds, length, reference_ds
 
