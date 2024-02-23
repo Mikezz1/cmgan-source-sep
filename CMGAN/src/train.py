@@ -48,6 +48,13 @@ parser.add_argument(
     default=[0.1, 0.2, 0.2, 0.5],
     help="weights of RI components, magnitude, time loss, and Metric Disc",
 )
+
+parser.add_argument(
+    "--overfit",
+    action="store_true",
+    help="overfit on single batch",
+)
+
 args = parser.parse_args()
 logging.basicConfig(level=logging.INFO)
 
@@ -84,7 +91,8 @@ class Trainer:
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.init_lr)
 
         self.speaker_embedder = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb"
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            run_opts={"device": "cuda:0" if torch.cuda.is_available() else "cpu"},
         )
         self.speaker_embedder = self.speaker_embedder.to(device)
 
@@ -185,41 +193,34 @@ class Trainer:
         generator_outputs["one_labels"] = one_labels
         generator_outputs["clean"] = clean
 
-        snr = si_sdr(
-            generator_outputs["est_audio"].detach(), generator_outputs["clean"].detach()
+        sdr = si_sdr(
+            generator_outputs["est_audio"].cpu().detach(),
+            generator_outputs["clean"].cpu().detach(),
         )
 
         loss = self.calculate_generator_loss(generator_outputs)
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        # Train Discriminator
-        discrim_loss_metric = None
 
-        return loss.item(), 0, snr
+        return loss.item(), sdr
 
     @torch.no_grad()
     def test_step(self, batch):
         clean = batch[0].to(device)
         noisy = batch[1].to(device)
         reference = batch[-1].to(device)
-        one_labels = torch.ones(args.batch_size).to(device)
 
         generator_outputs = self.forward_generator_step(
             clean,
             noisy,
             reference,
         )
-        generator_outputs["one_labels"] = one_labels
         generator_outputs["clean"] = clean
 
         loss = self.calculate_generator_loss(generator_outputs)
 
-        discrim_loss_metric = (
-            None  # self.calculate_discriminator_loss(generator_outputs)
-        )
-
-        return loss.item(), 0  # discrim_loss_metric.item()
+        return loss.item()
 
     def test(self):
         self.model.eval()
@@ -227,15 +228,13 @@ class Trainer:
         disc_loss_total = 0.0
         for idx, batch in enumerate(self.test_ds):
             step = idx + 1
-            loss, disc_loss = self.test_step(batch)
+            loss = self.test_step(batch)
             gen_loss_total += loss
-            disc_loss_total += disc_loss
         gen_loss_avg = gen_loss_total / step
-        disc_loss_avg = disc_loss_total / step
 
         template = "GPU: {}, Generator loss: {}, Discriminator loss: {}"
-        wandb.log({"test/loss": loss, "test/disc_loss": disc_loss})
-        logging.info(template.format(0, gen_loss_avg, disc_loss_avg))
+        wandb.log({"test/loss": gen_loss_avg.detach().cpu()})
+        logging.info(template.format(0, gen_loss_avg))
 
         return gen_loss_avg
 
@@ -250,16 +249,13 @@ class Trainer:
             self.model.train()
             for idx, batch in enumerate(self.train_ds):
                 step = idx + 1
-                loss, disc_loss, snr = self.train_step(batch)
-                template = (
-                    "GPU: {}, Epoch {}, Step {}, loss: {}, disc_loss: {}, snr: {}"
-                )
+                loss, snr = self.train_step(batch)
+                template = "GPU: {}, Epoch {}, Step {}, loss: {}, snr: {}"
                 if (step % args.log_interval) == 0:
-                    logging.info(template.format(0, epoch, step, loss, disc_loss, snr))
+                    logging.info(template.format(0, epoch, step, loss, snr))
                     wandb.log(
                         {
                             "train/loss": loss,
-                            "train/disc_loss": disc_loss,
                             "train/snr": snr,
                         }
                     )
@@ -292,9 +288,9 @@ def main(args):
         },
     )
     train_ds, test_ds = dataloader.load_data(
-        args.data_dir, args.batch_size, 4, args.cut_len, overfit=False
+        args.data_dir, args.batch_size, 4, args.cut_len, overfit=args.overfit
     )
-    trainer = Trainer(train_ds, test_ds)
+    trainer = Trainer(train_ds, test_ds, overfit=args.overfit)
     trainer.train()
 
 
