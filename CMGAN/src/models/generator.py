@@ -88,7 +88,7 @@ class TSCB(nn.Module):
             attn_dropout=0.2,
             ff_dropout=0.2,
         )
-        self.se_projection = nn.Linear(192, num_channel)
+        
         self.ln = nn.LayerNorm(num_channel)
 
     def forward(self, x_in, speaker_embed=None):
@@ -99,10 +99,7 @@ class TSCB(nn.Module):
         x_f = self.freq_conformer(x_f) + x_f
         x_f = x_f.view(b, t, f, c).permute(0, 3, 1, 2)
 
-        if speaker_embed is not None:
-            se = self.se_projection(speaker_embed).transpose(1, 2).unsqueeze(-1)
-            x_f = x_f + se
-            # x_f = self.ln(x_f.transpose(1, 3)).transpose(1, 3)
+
         return x_f
 
 
@@ -177,6 +174,7 @@ class TSCNet(nn.Module):
             num_features, num_channel=num_channel, out_channel=1
         )
         self.complex_decoder = ComplexDecoder(num_channel=num_channel)
+        self.se_projection = nn.Linear(192, num_channel)
 
     def forward(self, x, speaker_embed=None):
         mag = torch.sqrt(x[:, 0, :, :] ** 2 + x[:, 1, :, :] ** 2).unsqueeze(1)
@@ -186,6 +184,16 @@ class TSCNet(nn.Module):
         x_in = torch.cat([mag, x], dim=1)
 
         out_1 = self.dense_encoder(x_in)
+        
+        if speaker_embed is not None:
+            
+            se = self.se_projection(speaker_embed).transpose(1, 2).unsqueeze(-1)
+            # print(se.size())
+            # print(out_1.size())
+            out_1 = out_1 + se
+            # x_f = self.ln(x_f.transpose(1, 3)).transpose(1, 3)
+        
+        
         out_2 = self.TSCB_1(out_1, speaker_embed=speaker_embed)
         out_3 = self.TSCB_2(out_2, speaker_embed=speaker_embed)
         out_4 = self.TSCB_3(out_3, speaker_embed=speaker_embed)

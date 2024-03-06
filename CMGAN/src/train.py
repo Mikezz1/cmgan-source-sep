@@ -48,7 +48,7 @@ parser.add_argument(
 parser.add_argument(
     "--loss_weights",
     type=list,
-    default=[0.1, 0.2, 0.2, 0.5],
+    default=[0.0, 0.0, 0.0, 1.0],
     help="weights of RI components, magnitude, time loss, and Metric Disc",
 )
 
@@ -83,12 +83,12 @@ class Trainer:
     def __init__(self, train_ds, test_ds, overfit=False, use_mp=True):
         self.n_fft = 160
         self.hop = 100
-        self.overfit = overfit
+        self.overfit = False
         self.train_ds = train_ds
         self.test_ds = test_ds
         self.use_mp = use_mp and torch.cuda.is_available()
         self.scaler = GradScaler()
-        self.model = TSCNet(num_channel=64, num_features=self.n_fft // 2 + 1).to(device)
+        self.model = TSCNet(num_channel=128, num_features=self.n_fft // 2 + 1).to(device)
         summary(
             self.model, [(1, 2, args.cut_len // self.hop + 1, int(self.n_fft / 2) + 1)]
         )
@@ -193,12 +193,14 @@ class Trainer:
             torch.abs(generator_outputs["est_audio"] - generator_outputs["clean"])
         )
 
-        loss = (
-            args.loss_weights[0] * loss_ri
-            + args.loss_weights[1] * loss_mag
-            + args.loss_weights[2] * time_loss
-            + args.loss_weights[3] * gen_loss_GAN
-        )
+
+        # loss = (
+        #     args.loss_weights[0] * loss_ri
+        #     + args.loss_weights[1] * loss_mag
+        #     + args.loss_weights[2] * time_loss
+        #     + args.loss_weights[3] * gen_loss_GAN
+        # )
+        loss = gen_loss_GAN
 
         return (
             loss,
@@ -264,15 +266,22 @@ class Trainer:
         clean = batch[0].to(device)
         noisy = batch[1].to(device)
         reference = batch[-1].to(device)
-
-        generator_outputs = self.forward_generator_step(
-            clean,
-            noisy,
-            reference,
+        
+        mp_context = (
+            torch.autocast(device_type="cuda", dtype=torch.float16)
+            if self.use_mp
+            else contextlib.suppress()
         )
-        generator_outputs["clean"] = clean
 
-        loss, _, _, _, sdr = self.calculate_generator_loss(generator_outputs)
+        with mp_context:
+            generator_outputs = self.forward_generator_step(
+                clean,
+                noisy,
+                reference,
+            )
+            generator_outputs["clean"] = clean
+
+            loss, _, _, _, sdr = self.calculate_generator_loss(generator_outputs)
 
         return loss.item(), sdr.cpu().item()
 
@@ -285,8 +294,8 @@ class Trainer:
             loss, sdr = self.test_step(batch)
             gen_loss_total += loss
             sdr_total += sdr
-        gen_loss_avg = gen_loss_total / step
-        sdr_total_avg = sdr_total / step
+        gen_loss_avg = gen_loss_total / max(step, 1)
+        sdr_total_avg = sdr_total / max(step, 1)
 
         template = "GPU: {}, Validation loss: {}, SDR: {}"
         wandb.log({"test/loss": gen_loss_avg, "test/snr": sdr_total_avg})
@@ -379,7 +388,7 @@ def main(args):
     wandb.login()
 
     run = wandb.init(
-        project="cmgan-ss",
+        project="mvoleynik_nemo",
         config={
             "init_lr": args.init_lr,
             "bath_size": args.batch_size,

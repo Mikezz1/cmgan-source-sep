@@ -14,7 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 class LibrimixDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir, cut_len=16000 * 2, overfit=False):
-        self.overfit = overfit
+        self.overfit = False
         self.cut_len = cut_len
         self.mix_dir = os.path.join(data_dir, "mix")
         self.target_dir = os.path.join(data_dir, "target")
@@ -146,14 +146,14 @@ def load_data(ds_dir, batch_size, n_cpu, cut_len, overfit=False):
     train_dir = os.path.join(ds_dir, "train")
     test_dir = os.path.join(ds_dir, "test")
 
-    train_ds = LibrimixDataset(train_dir, cut_len, overfit=overfit)
-    test_ds = LibrimixDataset(test_dir, cut_len, overfit=overfit)
+    train_ds = LibrimixDataset(train_dir, cut_len, overfit=False)
+    test_ds = LibrimixDataset(test_dir, cut_len, overfit=False)
 
     train_dataset = torch.utils.data.DataLoader(
         dataset=train_ds,
         batch_size=batch_size,
         pin_memory=True,
-        shuffle=False,
+        shuffle=True,
         # sampler=DistributedSampler(train_ds),
         drop_last=True,
         num_workers=n_cpu,
