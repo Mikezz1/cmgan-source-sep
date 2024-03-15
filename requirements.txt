@@ -12,3 +12,4 @@ torchinfo==1.5.3
 wandb
 speechbrain
 torchmetrics
+asteroid

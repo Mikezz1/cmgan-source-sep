@@ -12,12 +12,10 @@ import wandb
 from torch.cuda.amp import GradScaler
 import contextlib
 from tqdm import tqdm
+from asteroid.losses import pairwise_neg_sisdr
+from asteroid.losses.pit_wrapper import PITLossWrapper
 
 import numpy as np
-
-from torchmetrics import ScaleInvariantSignalNoiseRatio
-
-from speechbrain.pretrained import EncoderClassifier
 
 
 parser = argparse.ArgumentParser()
@@ -102,7 +100,6 @@ class Trainer:
                 "auto_mix_prec": True,
             },
         )
-        self.speaker_embedder = self.speaker_embedder.to(device)
 
     @torch.no_grad()
     def get_grad_norm(self, model, norm_type=2):
@@ -121,100 +118,91 @@ class Trainer:
         )
         return total_norm.item()
 
-    def forward_generator_step(self, clean, noisy, reference):
+    def forward_generator_step(self, s1, s2, mix):
         # Normalization
-        c = torch.sqrt(noisy.size(-1) / torch.sum((noisy**2.0), dim=-1))
-        noisy, clean = torch.transpose(noisy, 0, 1), torch.transpose(clean, 0, 1)
-        noisy, clean = torch.transpose(noisy * c, 0, 1), torch.transpose(
-            clean * c, 0, 1
-        )
 
-        se = self.speaker_embedder.encode_batch(reference.to(device))
-
-        noisy_spec = torch.stft(
-            noisy,
+        mix_spec = torch.stft(
+            mix,
             self.n_fft,
             self.hop,
             window=torch.hamming_window(self.n_fft).to(device),
             onesided=True,
             return_complex=False,
         )
-        clean_spec = torch.stft(
-            clean,
+        s1_spec = torch.stft(
+            s1,
             self.n_fft,
             self.hop,
             window=torch.hamming_window(self.n_fft).to(device),
             onesided=True,
             return_complex=False,
         )
-        noisy_spec = power_compress(noisy_spec).permute(0, 1, 3, 2)
-        clean_spec = power_compress(clean_spec)
-        clean_real = clean_spec[:, 0, :, :].unsqueeze(1)
-        clean_imag = clean_spec[:, 1, :, :].unsqueeze(1)
+        s2_spec = torch.stft(
+            s2,
+            self.n_fft,
+            self.hop,
+            window=torch.hamming_window(self.n_fft).to(device),
+            onesided=True,
+            return_complex=False,
+        )
 
-        est_real, est_imag = self.model(noisy_spec, speaker_embed=se)
-        est_real, est_imag = est_real.permute(0, 1, 3, 2), est_imag.permute(0, 1, 3, 2)
-        est_mag = torch.sqrt(est_real**2 + est_imag**2)
-        clean_mag = torch.sqrt(clean_real**2 + clean_imag**2)
+        mix_spec = power_compress(mix_spec).permute(0, 1, 3, 2)
+        s1_spec = power_compress(s1_spec)
+        s2_spec = power_compress(s2_spec)
+        
+        s1_real = s1_spec[:, 0, :, :].unsqueeze(1)
+        s1_imag = s1_spec[:, 1, :, :].unsqueeze(1)
 
-        est_spec_uncompress = power_uncompress(est_real, est_imag).squeeze(1)
-        est_audio = torch.istft(
-            torch.view_as_complex(est_spec_uncompress),
+        s2_real = s2_spec[:, 0, :, :].unsqueeze(1)
+        s2_imag = s2_spec[:, 1, :, :].unsqueeze(1)
+
+        est_s1_real, est_s1_imag, est_s2_real, est_s2_imag,  = self.model(mix_spec, speaker_embed=None)
+        est_s1_real, est_s1_imag = est_s1_real.permute(0, 1, 3, 2), est_s1_imag.permute(0, 1, 3, 2)
+        est_s2_real, est_s2_imag = est_s2_real.permute(0, 1, 3, 2), est_s2_imag.permute(0, 1, 3, 2)
+
+        est_s1_real = torch.sqrt(est_s1_real**2 + est_s1_imag**2)
+        est_s2_real = torch.sqrt(est_s2_real**2 + est_s2_imag**2)
+
+        s1_mag = torch.sqrt(s1_real**2 + s1_imag**2)
+        s2_mag = torch.sqrt(s2_real**2 + s2_imag**2)
+
+        est_spec_uncompress_s1 = power_uncompress(est_s1_real, est_s1_imag).squeeze(1)
+        est_spec_uncompress_s2 = power_uncompress(est_s2_real, est_s2_imag).squeeze(1)
+
+        est_audio_s1 = torch.istft(
+            torch.view_as_complex(est_spec_uncompress_s1),
             self.n_fft,
             self.hop,
             window=torch.hamming_window(self.n_fft).to(device),
             onesided=True,
         )
 
-        return {
-            "est_real": est_real,
-            "est_imag": est_imag,
-            "est_mag": est_mag,
-            "clean_real": clean_real,
-            "clean_imag": clean_imag,
-            "clean_mag": clean_mag,
-            "est_audio": est_audio,
-        }
+        est_audio_s2 = torch.istft(
+            torch.view_as_complex(est_spec_uncompress_s1),
+            self.n_fft,
+            self.hop,
+            window=torch.hamming_window(self.n_fft).to(device),
+            onesided=True,
+        )
+
+        return est_audio_s1, est_audio_s2, s1, s2
 
     def calculate_generator_loss(self, generator_outputs):
-        length = generator_outputs["est_audio"].size(-1)
-        est_audio_list = generator_outputs["est_audio"]
-        clean_audio_list = generator_outputs["clean"][:, :length]
-        gen_loss_GAN = -discriminator.sdr_loss(est_audio_list, clean_audio_list)
 
-        loss_mag = F.l1_loss(
-            generator_outputs["est_mag"], generator_outputs["clean_mag"]
-        )
-        loss_ri = F.l1_loss(
-            generator_outputs["est_real"], generator_outputs["clean_real"]
-        ) + F.l1_loss(generator_outputs["est_imag"], generator_outputs["clean_imag"])
+        s1_est, s2_est, s1, s2 = generator_outputs
 
-        time_loss = torch.mean(
-            torch.abs(generator_outputs["est_audio"] - generator_outputs["clean"])
-        )
+        est_sources = torch.stack([s1_est, s2_est], dim=0).transpose(1,0)
+        sources = torch.stack([s1, s2], dim=0).transpose(1,0)
 
+        loss_func = PITLossWrapper(pairwise_neg_sisdr, pit_from='pw_mtx')
+        loss = loss_func(est_sources, sources)
 
-        # loss = (
-        #     args.loss_weights[0] * loss_ri
-        #     + args.loss_weights[1] * loss_mag
-        #     + args.loss_weights[2] * time_loss
-        #     + args.loss_weights[3] * gen_loss_GAN
-        # )
-        loss = gen_loss_GAN
-
-        return (
-            loss,
-            loss_ri.detach().cpu(),
-            loss_mag.detach().cpu(),
-            time_loss.detach().cpu(),
-            gen_loss_GAN.detach().cpu(),
-        )
+        return loss
 
     def train_step(self, batch):
         # Trainer generator
-        clean = batch[0].to(device)
-        noisy = batch[1].to(device)
-        reference = batch[-1].to(device)
+        s1_ds, s2_ds, mix_ds, length = batch
+        s1_ds, s2_ds, mix_ds, length = s1_ds.to(device), s2_ds.to(device), mix_ds.to(device), length.to(device)
 
         self.optimizer.zero_grad()
 
@@ -226,18 +214,10 @@ class Trainer:
 
         with mp_context:
             generator_outputs = self.forward_generator_step(
-                clean,
-                noisy,
-                reference,
-            )
-            generator_outputs["clean"] = clean
-
-            sdr = si_sdr(
-                generator_outputs["est_audio"].cpu().detach(),
-                generator_outputs["clean"].cpu().detach(),
+                s1_ds, s2_ds, mix_ds        
             )
 
-            loss, loss_ri, loss_mag, time_loss, sdr_loss = (
+            loss  = (
                 self.calculate_generator_loss(generator_outputs)
             )
 
@@ -251,21 +231,12 @@ class Trainer:
 
         return (
             loss.item(),
-            sdr,
-            generator_outputs["est_audio"].cpu().detach(),
-            clean.cpu(),
-            noisy.cpu(),
-            loss_ri,
-            loss_mag,
-            time_loss,
-            sdr_loss,
         )
 
     @torch.no_grad()
     def test_step(self, batch):
-        clean = batch[0].to(device)
-        noisy = batch[1].to(device)
-        reference = batch[-1].to(device)
+        s1_ds, s2_ds, mix_ds, length = batch
+        s1_ds, s2_ds, mix_ds, length = s1_ds.to(device), s2_ds.to(device), mix_ds.to(device), length.to(device)
         
         mp_context = (
             torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -275,31 +246,26 @@ class Trainer:
 
         with mp_context:
             generator_outputs = self.forward_generator_step(
-                clean,
-                noisy,
-                reference,
+                s1_ds, s2_ds, mix_ds        
             )
-            generator_outputs["clean"] = clean
 
-            loss, _, _, _, sdr = self.calculate_generator_loss(generator_outputs)
+            loss = self.calculate_generator_loss(generator_outputs)
 
-        return loss.item(), sdr.cpu().item()
+        return loss.item()
 
     def test(self):
         self.model.eval()
         gen_loss_total = 0.0
-        sdr_total = 0.0
-        for idx, batch in enumerate(self.test_ds):
-            step = idx + 1
-            loss, sdr = self.test_step(batch)
-            gen_loss_total += loss
-            sdr_total += sdr
-        gen_loss_avg = gen_loss_total / max(step, 1)
-        sdr_total_avg = sdr_total / max(step, 1)
+        with torch.no_grad():
+            for idx, batch in enumerate(self.test_ds):
+                step = idx + 1
+                loss= self.test_step(batch)
+                gen_loss_total += loss
+            gen_loss_avg = gen_loss_total / max(step, 1)
 
-        template = "GPU: {}, Validation loss: {}, SDR: {}"
-        wandb.log({"test/loss": gen_loss_avg, "test/snr": sdr_total_avg})
-        logging.info(template.format(0, gen_loss_avg, sdr_total_avg))
+        template = "GPU: {}, Validation loss: {}"
+        wandb.log({"test/loss": gen_loss_avg})
+        logging.info(template.format(0, gen_loss_avg))
 
         return gen_loss_avg
 
@@ -326,41 +292,30 @@ class Trainer:
             for idx, batch in enumerate(self.train_ds):
                 global_step += 1
                 step = idx + 1
-                (
-                    loss,
-                    snr,
-                    generated_audio,
-                    clean,
-                    noisy,
-                    loss_ri,
-                    loss_mag,
-                    time_loss,
-                    sdr_loss,
-                ) = self.train_step(batch)
-                template = "GPU: {}, Epoch {}, Step {}, loss: {}, snr: {}"
+                loss = self.train_step(batch)
+                template = "GPU: {}, Epoch {}, Step {}, loss: {}"
                 if (step % args.log_interval) == 0 or (
                     self.overfit and (epoch % args.log_interval == 0)
                 ):
-                    logging.info(template.format(0, epoch, step, loss, snr))
+                    logging.info(template.format(0, epoch, step, loss))
                     wandb.log(
                         {
                             "train/loss": loss,
-                            "train/snr": snr,
                             "train/lr": scheduler_G.get_last_lr()[0],
-                            "train/audio_source": wandb.Audio(
-                                clean[0].numpy().T, sample_rate=8000
-                            ),
-                            "train/audio_est": wandb.Audio(
-                                generated_audio[0].numpy().T, sample_rate=8000
-                            ),
-                            "train/audio_mix": wandb.Audio(
-                                noisy[0].numpy().T, sample_rate=8000
-                            ),
+                            # "train/audio_source": wandb.Audio(
+                            #     clean[0].numpy().T, sample_rate=8000
+                            # ),
+                            # "train/audio_est": wandb.Audio(
+                            #     generated_audio[0].numpy().T, sample_rate=8000
+                            # ),
+                            # "train/audio_mix": wandb.Audio(
+                            #     noisy[0].numpy().T, sample_rate=8000
+                            # ),
                             "train/epoch": epoch,
                             "train/global_step": global_step,
-                            "train/loss_ri": loss_ri,
-                            "train/loss_mag": loss_mag,
-                            "train/time_loss": time_loss,
+                            # "train/loss_ri": loss_ri,
+                            # "train/loss_mag": loss_mag,
+                            # "train/time_loss": time_loss,
                             "model/grad_norm": self.get_grad_norm(self.model),
                         }
                     )

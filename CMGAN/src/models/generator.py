@@ -174,7 +174,7 @@ class TSCNet(nn.Module):
             num_features, num_channel=num_channel, out_channel=1
         )
         self.complex_decoder = ComplexDecoder(num_channel=num_channel)
-        self.se_projection = nn.Linear(192, num_channel)
+        # self.se_projection = nn.Linear(192, num_channel)
 
     def forward(self, x, speaker_embed=None):
         mag = torch.sqrt(x[:, 0, :, :] ** 2 + x[:, 1, :, :] ** 2).unsqueeze(1)
@@ -185,13 +185,13 @@ class TSCNet(nn.Module):
 
         out_1 = self.dense_encoder(x_in)
         
-        if speaker_embed is not None:
+        # if speaker_embed is not None:
             
-            se = self.se_projection(speaker_embed).transpose(1, 2).unsqueeze(-1)
-            # print(se.size())
-            # print(out_1.size())
-            out_1 = out_1 + se
-            # x_f = self.ln(x_f.transpose(1, 3)).transpose(1, 3)
+        #     se = self.se_projection(speaker_embed).transpose(1, 2).unsqueeze(-1)
+        #     # print(se.size())
+        #     # print(out_1.size())
+        #     out_1 = out_1 + se
+        #     # x_f = self.ln(x_f.transpose(1, 3)).transpose(1, 3)
         
         
         out_2 = self.TSCB_1(out_1, speaker_embed=speaker_embed)
@@ -199,13 +199,24 @@ class TSCNet(nn.Module):
         out_4 = self.TSCB_3(out_3, speaker_embed=speaker_embed)
         out_5 = self.TSCB_4(out_4, speaker_embed=speaker_embed)
 
-        mask = self.mask_decoder(out_5)
-        out_mag = mask * mag
+        # 1
+        mask1 = self.mask_decoder(out_5)
+        out_mag1 = mask1 * mag
 
-        complex_out = self.complex_decoder(out_5)
-        mag_real = out_mag * torch.cos(noisy_phase)
-        mag_imag = out_mag * torch.sin(noisy_phase)
-        final_real = mag_real + complex_out[:, 0, :, :].unsqueeze(1)
-        final_imag = mag_imag + complex_out[:, 1, :, :].unsqueeze(1)
+        complex_out1 = self.complex_decoder(out_5)
+        mag_real1 = out_mag1 * torch.cos(noisy_phase)
+        mag_imag1 = out_mag1 * torch.sin(noisy_phase)
+        final_real1 = mag_real1 + complex_out1[:, 0, :, :].unsqueeze(1)
+        final_imag1 = mag_imag1 + complex_out1[:, 1, :, :].unsqueeze(1)
 
-        return final_real, final_imag
+        # 2
+        mask2 = self.mask_decoder(out_5)
+        out_mag2 = mask2 * mag
+
+        complex_out2 = self.complex_decoder(out_5)
+        mag_real2 = out_mag2 * torch.cos(noisy_phase)
+        mag_imag2 = out_mag2 * torch.sin(noisy_phase)
+        final_real2 = mag_real2 + complex_out2[:, 0, :, :].unsqueeze(1)
+        final_imag12= mag_imag2 + complex_out2[:, 1, :, :].unsqueeze(1)
+
+        return final_real1, final_imag1, final_real2, final_imag12

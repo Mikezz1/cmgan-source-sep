@@ -12,6 +12,66 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 from torch.utils.data.distributed import DistributedSampler
 
 
+
+class LibrimixBSSDataset(torch.utils.data.Dataset):
+    def __init__(self, data_dir, cut_len=16000 * 2, overfit=False):
+        self.overfit = False
+        self.cut_len = cut_len
+        self.mix_dir = os.path.join(data_dir, "mix")
+        self.s1_dir = os.path.join(data_dir, "s1")
+        self.s2_dir = os.path.join(data_dir, "s2")
+
+        self.mix_wav_name = os.listdir(self.mix_dir)
+
+
+    def __len__(self):
+        return len(self.mix_wav_name)
+
+    def __getitem__(self, idx):
+        s1_file = os.path.join(self.s1_dir, self.mix_wav_name[idx])
+        s2_file = os.path.join(self.s2_dir, self.mix_wav_name[idx])
+
+        mix_file = os.path.join(self.mix_dir, self.mix_wav_name[idx])
+
+        s1_ds, _ = torchaudio.load(s1_file)
+        s2_ds, _ = torchaudio.load(s2_file)
+        mix_ds, _ = torchaudio.load(mix_file)
+
+
+        s1_ds = s1_ds.squeeze()
+        s2_ds = s2_ds.squeeze()
+        mix_ds = mix_ds.squeeze()
+        
+        length = len(s1_ds)
+        assert length == len(mix_ds)
+        if length < self.cut_len:
+            units = self.cut_len // length
+            target_ds_final = []
+            mix_ds_final = []
+            reference_ds_final = []
+            for i in range(units):
+                target_ds_final.append(target_ds)
+                mix_ds_final.append(mix_ds)
+                reference_ds_final.append(reference_ds)
+            target_ds_final.append(target_ds[: self.cut_len % length])
+            mix_ds_final.append(mix_ds[: self.cut_len % length])
+            reference_ds_final.append(reference_ds[: self.cut_len % length])
+            target_ds = torch.cat(target_ds_final, dim=-1)
+            mix_ds = torch.cat(mix_ds_final, dim=-1)
+            reference_ds = torch.cat(reference_ds_final, dim=-1)
+        else:
+            # randomly cut 2 seconds segment
+            if self.overfit:
+                wav_start = 0
+            else:
+                wav_start = random.randint(0, length - self.cut_len)
+            mix_ds = mix_ds[wav_start : wav_start + self.cut_len]
+            s1_ds = s1_ds[wav_start : wav_start + self.cut_len]
+            s2_ds = s2_ds[wav_start : wav_start + self.cut_len]
+
+        return s1_ds, s2_ds, mix_ds, length
+
+
 class LibrimixDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir, cut_len=16000 * 2, overfit=False):
         self.overfit = False
